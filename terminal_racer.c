@@ -1,10 +1,10 @@
 /*
  * terminal_racer.c
- * 无限赛道版：动态生成无限延伸赛道，视角可调，彩色渲染，带中心虚线
+ * 终极版：无限赛道 + 地形自适应相机 + 彩色渲染 + 中心虚线 + 随机景物
  *
  * 可调参数宏定义（位于文件开头）
  *   CAMERA_DIST      相机与车辆距离（默认 3.0）
- *   CAMERA_HEIGHT    相机高度（默认 3.5）
+ *   CAMERA_HEIGHT    相机高度（默认 2.0）
  *   TRACK_WIDTH      赛道半宽（默认 4.0）
  *   ACCEL_FORWARD    前进加速度 (m/s²) 默认 10.0
  *   ACCEL_BACK       刹车/倒车加速度 (m/s²) 默认 8.0
@@ -31,8 +31,8 @@
 #include <stdbool.h>
 
 // ========== 可调参数宏 ==========
-#define CAMERA_DIST     3.0f     // 相机与车辆距离（原8→3）
-#define CAMERA_HEIGHT   3.5f     // 相机高度
+#define CAMERA_DIST     3.0f     // 相机与车辆距离（视角拉近）
+#define CAMERA_HEIGHT   2.0f     // 相机高度（适当降低，贴近路面）
 #define TRACK_WIDTH     4.0f     // 赛道半宽
 #define ACCEL_FORWARD   10.0f    // 前进加速度 (m/s²)
 #define ACCEL_BACK      8.0f     // 刹车/倒车加速度 (m/s²)
@@ -91,7 +91,7 @@ static mat4 mat4_frustum(float l, float r, float b, float t, float n, float f) {
     return m;
 }
 
-// 视图矩阵
+// 视图矩阵（up 向量动态传入）
 static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
     vec3 f = vec3_norm(vec3_sub(center, eye));
     vec3 s = vec3_norm(vec3_cross(f, up));
@@ -103,12 +103,13 @@ static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
     return m;
 }
 
-// ========== 无限赛道生成 ==========
+// ========== 无限赛道生成（带法线） ==========
 typedef struct {
     vec3* ctrl_pts;          // 控制点数组 [NUM_CTRL_PTS]
     vec3* center;            // 插值中心点数组 [total_points]
     vec3* left;              // 左边界数组 [total_points]
     vec3* right;             // 右边界数组 [total_points]
+    vec3* normal;            // 路面法线数组 [total_points]
     int total_points;        // 插值点总数 = (NUM_CTRL_PTS-1)*NUM_SEGMENTS
 } InfiniteTrack;
 
@@ -125,7 +126,7 @@ static vec3 catmull_rom(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float t) {
             vec3_mul(p3, t3 - t2)));
 }
 
-// 初始化无限赛道（生成初始控制点）
+// 初始化无限赛道
 static InfiniteTrack* create_infinite_track(void) {
     InfiniteTrack* track = malloc(sizeof(InfiniteTrack));
     track->ctrl_pts = malloc(NUM_CTRL_PTS * sizeof(vec3));
@@ -133,6 +134,7 @@ static InfiniteTrack* create_infinite_track(void) {
     track->center = malloc(track->total_points * sizeof(vec3));
     track->left   = malloc(track->total_points * sizeof(vec3));
     track->right  = malloc(track->total_points * sizeof(vec3));
+    track->normal = malloc(track->total_points * sizeof(vec3));
 
     // 生成初始控制点（Z从0开始递增）
     for (int i = 0; i < NUM_CTRL_PTS; i++) {
@@ -142,13 +144,22 @@ static InfiniteTrack* create_infinite_track(void) {
         float y = 3.0f * sinf(z * 0.15f) + 2.0f * cosf(z * 0.37f);
         track->ctrl_pts[i] = (vec3){x, y, z};
     }
-
-    // 重新计算所有插值点
-    // (将在外部调用 update_track 完成)
     return track;
 }
 
-// 根据当前控制点重新计算插值点（中心线、左右边界）
+// 计算法线（给定中心点、右方向点和切线方向）
+static vec3 compute_normal(vec3 center, vec3 right, vec3 tangent) {
+    // 右方向向量
+    vec3 right_dir = vec3_sub(right, center);
+    // 法线 = 叉积(切线, 右方向)，确保指向大致向上
+    vec3 n = vec3_cross(tangent, right_dir);
+    n = vec3_norm(n);
+    // 检查法线方向，如果Y分量为负则翻转（假设世界Y轴向上）
+    if (n.y < 0) n = vec3_mul(n, -1.0f);
+    return n;
+}
+
+// 重新计算所有插值点（中心、左右边界、法线）
 static void update_track(InfiniteTrack* track) {
     int total = 0;
     for (int i = 0; i < NUM_CTRL_PTS - 1; i++) {
@@ -156,8 +167,8 @@ static void update_track(InfiniteTrack* track) {
         vec3 p1 = track->ctrl_pts[i+1];
         vec3 p2 = (i+2 < NUM_CTRL_PTS) ? track->ctrl_pts[i+2] : track->ctrl_pts[i+1];
         vec3 p3 = (i+3 < NUM_CTRL_PTS) ? track->ctrl_pts[i+3] : p2;
-        // 对于端点，重复最后一个点以保持方向（简单处理）
-        if (i == 0) p0 = p1; // 实际上需要前一个点，这里简单重复
+        // 对于端点，简单处理
+        if (i == 0) p0 = p1;
         if (i == NUM_CTRL_PTS-2) p3 = p2;
 
         for (int j = 0; j < NUM_SEGMENTS; j++) {
@@ -165,33 +176,43 @@ static void update_track(InfiniteTrack* track) {
             vec3 center = catmull_rom(p0, p1, p2, p3, t);
             track->center[total] = center;
 
-            // 计算近似切线（使用差分）
+            // 计算切线（使用差分）
             vec3 next = catmull_rom(p0, p1, p2, p3, t + 0.01f);
             vec3 tangent = vec3_norm(vec3_sub(next, center));
-            vec3 up = {0,1,0};
-            vec3 right_dir = vec3_norm(vec3_cross(tangent, up));
-            vec3 left_dir = vec3_mul(right_dir, -1);
-            track->left[total] = vec3_add(center, vec3_mul(left_dir, TRACK_WIDTH));
+
+            // 计算右方向（使用世界Y轴作为临时上方向，得到水平右方向）
+            vec3 world_up = {0,1,0};
+            vec3 right_dir = vec3_norm(vec3_cross(tangent, world_up));
+            // 如果切线平行于Y轴，则回退
+            if (vec3_len(right_dir) < 0.1f) right_dir = (vec3){1,0,0};
+
+            // 左边界 = 中心 - 右方向 * TRACK_WIDTH
+            // 右边界 = 中心 + 右方向 * TRACK_WIDTH
+            track->left[total] = vec3_sub(center, vec3_mul(right_dir, TRACK_WIDTH));
             track->right[total] = vec3_add(center, vec3_mul(right_dir, TRACK_WIDTH));
+
+            // 计算法线：叉积(切线, 右方向) 并归一化，确保向上
+            vec3 normal = vec3_cross(tangent, right_dir);
+            normal = vec3_norm(normal);
+            if (normal.y < 0) normal = vec3_mul(normal, -1.0f);
+            track->normal[total] = normal;
 
             total++;
         }
     }
 }
 
-// 根据车辆位置更新赛道（如果车辆接近最后一个控制点，则在末尾添加新点并移除开头点）
+// 根据车辆位置更新赛道（无限延伸）
 static void advance_track(InfiniteTrack* track, float car_z) {
-    // 检查是否需要生成新段：当车辆Z超过倒数第二个控制点的Z - 一个阈值时
     float last_ctrl_z = track->ctrl_pts[NUM_CTRL_PTS-1].z;
     if (car_z > last_ctrl_z - 5.0f) {
         // 移除第一个控制点
         for (int i = 1; i < NUM_CTRL_PTS; i++) {
             track->ctrl_pts[i-1] = track->ctrl_pts[i];
         }
-        // 生成新控制点（基于最后一个控制点的位置）
-        vec3 last = track->ctrl_pts[NUM_CTRL_PTS-2]; // 原最后一个点（已移位）
+        // 生成新控制点
+        vec3 last = track->ctrl_pts[NUM_CTRL_PTS-2];
         float new_z = last.z + CTRL_PT_DIST;
-        // 使用正弦组合生成新点，保持连续性（基于new_z）
         float x = 8.0f * sinf(new_z * 0.1f) + 5.0f * cosf(new_z * 0.23f);
         float y = 3.0f * sinf(new_z * 0.15f) + 2.0f * cosf(new_z * 0.37f);
         track->ctrl_pts[NUM_CTRL_PTS-1] = (vec3){x, y, new_z};
@@ -201,16 +222,17 @@ static void advance_track(InfiniteTrack* track, float car_z) {
     }
 }
 
-// 释放赛道资源
+// 释放赛道
 static void free_track(InfiniteTrack* track) {
     free(track->ctrl_pts);
     free(track->center);
     free(track->left);
     free(track->right);
+    free(track->normal);
     free(track);
 }
 
-// ========== 随机景物（远景） ==========
+// ========== 随机景物 ==========
 #define NUM_OBJECTS 200
 typedef struct {
     vec3 pos;
@@ -220,12 +242,12 @@ typedef struct {
 
 static SceneObject objects[NUM_OBJECTS];
 
-// 生成景物（沿赛道随机分布，Z范围动态调整）
+// 生成景物（沿赛道随机分布）
 static void generate_objects(InfiniteTrack* track, float min_z, float max_z) {
     for (int i = 0; i < NUM_OBJECTS; i++) {
         float z = min_z + (float)rand() / RAND_MAX * (max_z - min_z);
-        // 根据Z生成X、Y，使用随机偏移，使景物散布在赛道两侧
-        float base_x = 8.0f * sinf(z * 0.1f) + 5.0f * cosf(z * 0.23f); // 近似赛道中心
+        // 近似赛道中心X
+        float base_x = 8.0f * sinf(z * 0.1f) + 5.0f * cosf(z * 0.23f);
         float offset = (15.0f + (float)rand() / RAND_MAX * 20.0f) * (rand()%2 ? 1 : -1);
         float x = base_x + offset;
         float y = 3.0f * sinf(z * 0.15f) + 2.0f * cosf(z * 0.37f) + ((float)rand()/RAND_MAX-0.5f)*4.0f;
@@ -357,13 +379,13 @@ int main(int argc, char** argv) {
 
     // 创建无限赛道
     InfiniteTrack* track = create_infinite_track();
-    update_track(track);  // 初始插值
+    update_track(track);
 
-    // 生成景物（基于初始Z范围）
+    // 生成景物
     generate_objects(track, track->ctrl_pts[0].z, track->ctrl_pts[NUM_CTRL_PTS-1].z);
 
     Car car = {
-        .pos = track->center[0],  // 起点
+        .pos = track->center[0],
         .yaw = 0,
         .speed = 0
     };
@@ -407,50 +429,52 @@ int main(int argc, char** argv) {
         car.pos.x += dir.x * car.speed * delta_time;
         car.pos.z += dir.z * car.speed * delta_time;
 
-        // 高度跟随赛道（最近点）
+        // 找到最近的赛道点，获取法线和目标点
+        int best_idx = 0;
         float min_dist = 1e9;
-        vec3 target = car.pos;
         for (int i=0; i<track->total_points; i++) {
             float dx = car.pos.x - track->center[i].x;
             float dz = car.pos.z - track->center[i].z;
             float dist = dx*dx + dz*dz;
             if (dist < min_dist) {
                 min_dist = dist;
-                target = track->center[i];
+                best_idx = i;
             }
         }
-        car.pos.y = target.y + 0.5f;
+        vec3 target = track->center[best_idx];
+        car.pos.y = target.y + 0.5f; // 车辆略高于路面
+
+        // 获取路面法线
+        vec3 normal = track->normal[best_idx];
 
         // 检查是否需要扩展赛道
         advance_track(track, car.pos.z);
 
-        // 更新景物范围（简单起见，每隔一段时间重新生成，但这里保持静态，可优化）
-        // 为简化，我们不再动态更新景物，但为了效果，可以每帧重新生成（但开销大）
-        // 此处保留初始景物，它们会在Z范围外消失，但新Z范围可能没有景物。
-        // 更好的做法是动态更新景物列表，但作为演示，我们跳过。
+        // 相机位置：基于车辆位置、前进方向、路面法线计算
+        // 注意：dir 是水平方向，normal 是路面法线，两者不一定垂直，但没关系
+        vec3 eye = vec3_add(car.pos, vec3_add(vec3_mul(dir, -CAMERA_DIST), vec3_mul(normal, CAMERA_HEIGHT)));
 
-        // 相机设置（使用宏 CAMERA_DIST 和 CAMERA_HEIGHT）
-        vec3 eye = vec3_add(car.pos, (vec3){ -CAMERA_DIST * sinf(car.yaw), CAMERA_HEIGHT, -CAMERA_DIST * cosf(car.yaw) });
+        // 注视点：车辆位置（也可注视前方一点，这里保持简单）
         vec3 center = car.pos;
-        vec3 up = {0,1,0};
-        mat4 view = mat4_lookat(eye, center, up);
 
+        // 构建视图矩阵，使用路面法线作为 up 向量
+        mat4 view = mat4_lookat(eye, center, normal);
+
+        // 渲染
         erase();
 
-        // 绘制赛道边界（双线样式：左边界用 '#', 右边界用 '|' 以区分）
+        // 绘制赛道边界
         for (int i=0; i<track->total_points-1; i++) {
             int x1,y1, x2,y2;
-            // 左边界
             if (project(track->left[i], view, proj, &x1, &y1) &&
                 project(track->left[i+1], view, proj, &x2, &y2))
                 draw_line(x1, y1, x2, y2, '#' | COLOR_PAIR(1));
-            // 右边界
             if (project(track->right[i], view, proj, &x1, &y1) &&
                 project(track->right[i+1], view, proj, &x2, &y2))
                 draw_line(x1, y1, x2, y2, '|' | COLOR_PAIR(1) | A_BOLD);
         }
 
-        // 绘制中心虚线（每隔几个点画一个点）
+        // 绘制中心虚线
         for (int i=0; i<track->total_points; i+=5) {
             int sx, sy;
             if (project(track->center[i], view, proj, &sx, &sy)) {
@@ -458,9 +482,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 绘制景物（仅绘制在可见范围内的）
+        // 绘制景物（仅绘制在可见范围内）
         for (int i=0; i<NUM_OBJECTS; i++) {
-            // 简单剔除：如果景物Z离车辆太远则不绘制（提高性能）
             if (fabs(objects[i].pos.z - car.pos.z) > 50.0f) continue;
             int sx, sy;
             if (project(objects[i].pos, view, proj, &sx, &sy)) {
@@ -468,7 +491,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 绘制车辆（用两个字符）
+        // 绘制车辆
         int car_x, car_y;
         if (project(car.pos, view, proj, &car_x, &car_y)) {
             chtype car_ch;
