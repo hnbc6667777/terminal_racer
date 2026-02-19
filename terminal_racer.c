@@ -1,8 +1,9 @@
 /*
  * terminal_racer.c
- * 终极版：无限赛道 + 地形自适应相机 + 可调俯仰角(U/I) + 彩色渲染 + 中心虚线 + 随机景物
+ * 终极版：无限赛道 + 地形自适应相机 + 可调俯仰角(U/I) + 重力势能 + 彩色渲染 + 中心虚线 + 随机景物
  *
  * 可调参数宏定义（位于文件开头）
+ *   GRAVITY          重力加速度 (m/s²) 默认 9.8
  *   CAMERA_DIST      相机与车辆距离（默认 3.0）
  *   CAMERA_HEIGHT    相机高度（默认 2.0）
  *   PITCH_SPEED      俯仰调整速度 (rad/s) 默认 1.0
@@ -33,17 +34,18 @@
 #include <stdbool.h>
 
 // ========== 可调参数宏 ==========
-#define CAMERA_DIST     3.0f     // 相机与车辆距离
-#define CAMERA_HEIGHT   2.0f     // 相机高度
-#define PITCH_SPEED     1.0f     // 俯仰调整速度 (rad/s)
-#define PITCH_LIMIT     30.0f    // 俯仰角度限制（度）
-#define TRACK_WIDTH     4.0f     // 赛道半宽
-#define ACCEL_FORWARD   10.0f    // 前进加速度 (m/s²)
-#define ACCEL_BACK      8.0f     // 刹车/倒车加速度 (m/s²)
-#define FRICTION_COEF   2.0f     // 摩擦系数 (1/s)
-#define CTRL_PT_DIST    10.0f    // 控制点间隔（米）
-#define NUM_CTRL_PTS    30       // 控制点数量
-#define NUM_SEGMENTS    200      // 每段插值点数
+#define GRAVITY          9.8f     // 重力加速度 (m/s²)
+#define CAMERA_DIST      3.0f     // 相机与车辆距离
+#define CAMERA_HEIGHT    2.0f     // 相机高度
+#define PITCH_SPEED      1.0f     // 俯仰调整速度 (rad/s)
+#define PITCH_LIMIT      30.0f    // 俯仰角度限制（度）
+#define TRACK_WIDTH      4.0f     // 赛道半宽
+#define ACCEL_FORWARD    10.0f    // 前进加速度 (m/s²)
+#define ACCEL_BACK       8.0f     // 刹车/倒车加速度 (m/s²)
+#define FRICTION_COEF    2.0f     // 摩擦系数 (1/s)
+#define CTRL_PT_DIST     10.0f    // 控制点间隔（米）
+#define NUM_CTRL_PTS     30       // 控制点数量
+#define NUM_SEGMENTS     200      // 每段插值点数
 
 // 俯仰限制转换为弧度
 #define PITCH_LIMIT_RAD (PITCH_LIMIT * M_PI / 180.0f)
@@ -110,13 +112,14 @@ static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
     return m;
 }
 
-// ========== 无限赛道生成（带法线） ==========
+// ========== 无限赛道生成（带法线和切线） ==========
 typedef struct {
     vec3* ctrl_pts;          // 控制点数组 [NUM_CTRL_PTS]
     vec3* center;            // 插值中心点数组 [total_points]
     vec3* left;              // 左边界数组 [total_points]
     vec3* right;             // 右边界数组 [total_points]
     vec3* normal;            // 路面法线数组 [total_points]
+    vec3* tangent;           // 切线方向数组（车辆前进方向） [total_points]
     int total_points;        // 插值点总数 = (NUM_CTRL_PTS-1)*NUM_SEGMENTS
 } InfiniteTrack;
 
@@ -142,6 +145,7 @@ static InfiniteTrack* create_infinite_track(void) {
     track->left   = malloc(track->total_points * sizeof(vec3));
     track->right  = malloc(track->total_points * sizeof(vec3));
     track->normal = malloc(track->total_points * sizeof(vec3));
+    track->tangent = malloc(track->total_points * sizeof(vec3));
 
     for (int i = 0; i < NUM_CTRL_PTS; i++) {
         float z = i * CTRL_PT_DIST;
@@ -152,16 +156,7 @@ static InfiniteTrack* create_infinite_track(void) {
     return track;
 }
 
-// 计算法线
-static vec3 compute_normal(vec3 center, vec3 right, vec3 tangent) {
-    vec3 right_dir = vec3_sub(right, center);
-    vec3 n = vec3_cross(tangent, right_dir);
-    n = vec3_norm(n);
-    if (n.y < 0) n = vec3_mul(n, -1.0f);
-    return n;
-}
-
-// 重新计算所有插值点
+// 重新计算所有插值点（中心、左右边界、法线、切线）
 static void update_track(InfiniteTrack* track) {
     int total = 0;
     for (int i = 0; i < NUM_CTRL_PTS - 1; i++) {
@@ -177,8 +172,10 @@ static void update_track(InfiniteTrack* track) {
             vec3 center = catmull_rom(p0, p1, p2, p3, t);
             track->center[total] = center;
 
+            // 计算切线（使用差分）
             vec3 next = catmull_rom(p0, p1, p2, p3, t + 0.01f);
             vec3 tangent = vec3_norm(vec3_sub(next, center));
+            track->tangent[total] = tangent;
 
             vec3 world_up = {0,1,0};
             vec3 right_dir = vec3_norm(vec3_cross(tangent, world_up));
@@ -219,6 +216,7 @@ static void free_track(InfiniteTrack* track) {
     free(track->left);
     free(track->right);
     free(track->normal);
+    free(track->tangent);
     free(track);
 }
 
@@ -414,16 +412,10 @@ int main(int argc, char** argv) {
         if (key_state[KEY_D]) steer -= 1;
         car.yaw += steer * 2.0f * delta_time;
 
-        float accel = 0;
-        if (key_state[KEY_W]) accel += ACCEL_FORWARD;
-        if (key_state[KEY_S]) accel -= ACCEL_BACK;
-        car.speed += accel * delta_time;
-        car.speed *= (1.0f - FRICTION_COEF * delta_time);
-        if (fabs(car.speed) < 0.001f) car.speed = 0;
-
-        vec3 dir = { sinf(car.yaw), 0, cosf(car.yaw) };
-        car.pos.x += dir.x * car.speed * delta_time;
-        car.pos.z += dir.z * car.speed * delta_time;
+        // 油门加速度（驾驶员输入）
+        float throttle_accel = 0;
+        if (key_state[KEY_W]) throttle_accel += ACCEL_FORWARD;
+        if (key_state[KEY_S]) throttle_accel -= ACCEL_BACK;
 
         // 找到最近的赛道点
         int best_idx = 0;
@@ -440,24 +432,42 @@ int main(int argc, char** argv) {
         vec3 target = track->center[best_idx];
         car.pos.y = target.y + 0.5f;
 
+        // 获取当前路面的切线方向（车辆前进方向应沿赛道）
+        vec3 tangent = track->tangent[best_idx];
+
+        // 重力加速度沿切线的分量：重力向量 (0, -GRAVITY, 0) 点乘切线方向
+        // 因为重力向下，切线方向的分量 = GRAVITY * (切线在Y方向的分量的负值)
+        // 即 GRAVITY * (-tangent.y)
+        float gravity_accel = -GRAVITY * tangent.y;  // 当 tangent.y 为正（上坡）时，gravity_accel 为负（减速）
+
+        // 总加速度 = 油门加速度 + 重力分量
+        float total_accel = throttle_accel + gravity_accel;
+
+        // 更新速度
+        car.speed += total_accel * delta_time;
+        // 摩擦
+        car.speed *= (1.0f - FRICTION_COEF * delta_time);
+        if (fabs(car.speed) < 0.001f) car.speed = 0;
+
+        // 更新位置
+        vec3 dir = { sinf(car.yaw), 0, cosf(car.yaw) };
+        car.pos.x += dir.x * car.speed * delta_time;
+        car.pos.z += dir.z * car.speed * delta_time;
+
         vec3 normal = track->normal[best_idx];
 
+        // 扩展赛道
         advance_track(track, car.pos.z);
 
-        // 基础相机位置（无俯仰）
+        // 基础相机位置
         vec3 eye_base = vec3_add(car.pos, vec3_add(vec3_mul(dir, -CAMERA_DIST), vec3_mul(normal, CAMERA_HEIGHT)));
-
-        // 基础注视点（车辆位置）
         vec3 center_base = car.pos;
 
-        // 应用俯仰：绕右轴旋转视线方向
-        // 计算右向量（基于基础视线和法线）
+        // 应用俯仰
         vec3 view_dir = vec3_norm(vec3_sub(center_base, eye_base));
-        vec3 right = vec3_norm(vec3_cross(view_dir, normal)); // 右方向（水平）
-        // 绕 right 旋转 view_dir 得到新方向
+        vec3 right = vec3_norm(vec3_cross(view_dir, normal));
         float cos_p = cosf(car.pitch);
         float sin_p = sinf(car.pitch);
-        // 使用罗德里格旋转公式
         vec3 new_dir = vec3_add(
             vec3_mul(view_dir, cos_p),
             vec3_add(
@@ -466,13 +476,8 @@ int main(int argc, char** argv) {
             )
         );
         new_dir = vec3_norm(new_dir);
-
-        // 新注视点：保持相机位置不变，沿新方向看向远处
-        // 为简单，保持原距离，计算新注视点
         float view_dist = vec3_len(vec3_sub(center_base, eye_base));
         vec3 new_center = vec3_add(eye_base, vec3_mul(new_dir, view_dist));
-
-        // 构建视图矩阵，使用路面法线作为 up
         mat4 view = mat4_lookat(eye_base, new_center, normal);
 
         // 渲染
@@ -523,9 +528,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 显示信息（包括俯仰角）
-        mvprintw(0, 0, "WASD 控制 | U/I 俯仰 | Q 退出 | 速度: %.2f m/s | 俯仰: %+3.0f° | FPS: %.1f | Z: %.1f",
-                 car.speed, car.pitch * 180.0f / M_PI, fps, car.pos.z);
+        // 显示信息（包括坡度）
+        float slope_percent = -tangent.y * 100.0f; // 正为上坡，负为下坡
+        mvprintw(0, 0, "WASD 控制 | U/I 俯仰 | Q 退出 | 速度: %+6.2f m/s | 坡度: %+5.1f%% | 俯仰: %+3.0f° | FPS: %.1f | Z: %.1f",
+                 car.speed, slope_percent, car.pitch * 180.0f / M_PI, fps, car.pos.z);
 
         refresh();
         usleep(1000);
