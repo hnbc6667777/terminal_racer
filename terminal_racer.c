@@ -1,10 +1,12 @@
 /*
  * terminal_racer.c
- * 终极版：无限赛道 + 地形自适应相机 + 彩色渲染 + 中心虚线 + 随机景物
+ * 终极版：无限赛道 + 地形自适应相机 + 可调俯仰角(U/I) + 彩色渲染 + 中心虚线 + 随机景物
  *
  * 可调参数宏定义（位于文件开头）
  *   CAMERA_DIST      相机与车辆距离（默认 3.0）
  *   CAMERA_HEIGHT    相机高度（默认 2.0）
+ *   PITCH_SPEED      俯仰调整速度 (rad/s) 默认 1.0
+ *   PITCH_LIMIT      俯仰角度限制（度）默认 30.0
  *   TRACK_WIDTH      赛道半宽（默认 4.0）
  *   ACCEL_FORWARD    前进加速度 (m/s²) 默认 10.0
  *   ACCEL_BACK       刹车/倒车加速度 (m/s²) 默认 8.0
@@ -31,15 +33,20 @@
 #include <stdbool.h>
 
 // ========== 可调参数宏 ==========
-#define CAMERA_DIST     3.0f     // 相机与车辆距离（视角拉近）
-#define CAMERA_HEIGHT   2.0f     // 相机高度（适当降低，贴近路面）
+#define CAMERA_DIST     3.0f     // 相机与车辆距离
+#define CAMERA_HEIGHT   2.0f     // 相机高度
+#define PITCH_SPEED     1.0f     // 俯仰调整速度 (rad/s)
+#define PITCH_LIMIT     30.0f    // 俯仰角度限制（度）
 #define TRACK_WIDTH     4.0f     // 赛道半宽
 #define ACCEL_FORWARD   10.0f    // 前进加速度 (m/s²)
 #define ACCEL_BACK      8.0f     // 刹车/倒车加速度 (m/s²)
 #define FRICTION_COEF   2.0f     // 摩擦系数 (1/s)
 #define CTRL_PT_DIST    10.0f    // 控制点间隔（米）
-#define NUM_CTRL_PTS    30       // 控制点数量（决定赛道可视长度）
-#define NUM_SEGMENTS    200      // 每段插值点数（总插值点数 = (NUM_CTRL_PTS-1)*NUM_SEGMENTS）
+#define NUM_CTRL_PTS    30       // 控制点数量
+#define NUM_SEGMENTS    200      // 每段插值点数
+
+// 俯仰限制转换为弧度
+#define PITCH_LIMIT_RAD (PITCH_LIMIT * M_PI / 180.0f)
 
 // ========== 3D 数学库 ==========
 typedef struct { float x, y, z; } vec3;
@@ -91,7 +98,7 @@ static mat4 mat4_frustum(float l, float r, float b, float t, float n, float f) {
     return m;
 }
 
-// 视图矩阵（up 向量动态传入）
+// 视图矩阵
 static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
     vec3 f = vec3_norm(vec3_sub(center, eye));
     vec3 s = vec3_norm(vec3_cross(f, up));
@@ -136,10 +143,8 @@ static InfiniteTrack* create_infinite_track(void) {
     track->right  = malloc(track->total_points * sizeof(vec3));
     track->normal = malloc(track->total_points * sizeof(vec3));
 
-    // 生成初始控制点（Z从0开始递增）
     for (int i = 0; i < NUM_CTRL_PTS; i++) {
         float z = i * CTRL_PT_DIST;
-        // 使用正弦组合模拟弯道和起伏
         float x = 8.0f * sinf(z * 0.1f) + 5.0f * cosf(z * 0.23f);
         float y = 3.0f * sinf(z * 0.15f) + 2.0f * cosf(z * 0.37f);
         track->ctrl_pts[i] = (vec3){x, y, z};
@@ -147,19 +152,16 @@ static InfiniteTrack* create_infinite_track(void) {
     return track;
 }
 
-// 计算法线（给定中心点、右方向点和切线方向）
+// 计算法线
 static vec3 compute_normal(vec3 center, vec3 right, vec3 tangent) {
-    // 右方向向量
     vec3 right_dir = vec3_sub(right, center);
-    // 法线 = 叉积(切线, 右方向)，确保指向大致向上
     vec3 n = vec3_cross(tangent, right_dir);
     n = vec3_norm(n);
-    // 检查法线方向，如果Y分量为负则翻转（假设世界Y轴向上）
     if (n.y < 0) n = vec3_mul(n, -1.0f);
     return n;
 }
 
-// 重新计算所有插值点（中心、左右边界、法线）
+// 重新计算所有插值点
 static void update_track(InfiniteTrack* track) {
     int total = 0;
     for (int i = 0; i < NUM_CTRL_PTS - 1; i++) {
@@ -167,7 +169,6 @@ static void update_track(InfiniteTrack* track) {
         vec3 p1 = track->ctrl_pts[i+1];
         vec3 p2 = (i+2 < NUM_CTRL_PTS) ? track->ctrl_pts[i+2] : track->ctrl_pts[i+1];
         vec3 p3 = (i+3 < NUM_CTRL_PTS) ? track->ctrl_pts[i+3] : p2;
-        // 对于端点，简单处理
         if (i == 0) p0 = p1;
         if (i == NUM_CTRL_PTS-2) p3 = p2;
 
@@ -176,22 +177,16 @@ static void update_track(InfiniteTrack* track) {
             vec3 center = catmull_rom(p0, p1, p2, p3, t);
             track->center[total] = center;
 
-            // 计算切线（使用差分）
             vec3 next = catmull_rom(p0, p1, p2, p3, t + 0.01f);
             vec3 tangent = vec3_norm(vec3_sub(next, center));
 
-            // 计算右方向（使用世界Y轴作为临时上方向，得到水平右方向）
             vec3 world_up = {0,1,0};
             vec3 right_dir = vec3_norm(vec3_cross(tangent, world_up));
-            // 如果切线平行于Y轴，则回退
             if (vec3_len(right_dir) < 0.1f) right_dir = (vec3){1,0,0};
 
-            // 左边界 = 中心 - 右方向 * TRACK_WIDTH
-            // 右边界 = 中心 + 右方向 * TRACK_WIDTH
             track->left[total] = vec3_sub(center, vec3_mul(right_dir, TRACK_WIDTH));
             track->right[total] = vec3_add(center, vec3_mul(right_dir, TRACK_WIDTH));
 
-            // 计算法线：叉积(切线, 右方向) 并归一化，确保向上
             vec3 normal = vec3_cross(tangent, right_dir);
             normal = vec3_norm(normal);
             if (normal.y < 0) normal = vec3_mul(normal, -1.0f);
@@ -206,23 +201,18 @@ static void update_track(InfiniteTrack* track) {
 static void advance_track(InfiniteTrack* track, float car_z) {
     float last_ctrl_z = track->ctrl_pts[NUM_CTRL_PTS-1].z;
     if (car_z > last_ctrl_z - 5.0f) {
-        // 移除第一个控制点
         for (int i = 1; i < NUM_CTRL_PTS; i++) {
             track->ctrl_pts[i-1] = track->ctrl_pts[i];
         }
-        // 生成新控制点
         vec3 last = track->ctrl_pts[NUM_CTRL_PTS-2];
         float new_z = last.z + CTRL_PT_DIST;
         float x = 8.0f * sinf(new_z * 0.1f) + 5.0f * cosf(new_z * 0.23f);
         float y = 3.0f * sinf(new_z * 0.15f) + 2.0f * cosf(new_z * 0.37f);
         track->ctrl_pts[NUM_CTRL_PTS-1] = (vec3){x, y, new_z};
-
-        // 重新计算所有插值点
         update_track(track);
     }
 }
 
-// 释放赛道
 static void free_track(InfiniteTrack* track) {
     free(track->ctrl_pts);
     free(track->center);
@@ -242,16 +232,13 @@ typedef struct {
 
 static SceneObject objects[NUM_OBJECTS];
 
-// 生成景物（沿赛道随机分布）
 static void generate_objects(InfiniteTrack* track, float min_z, float max_z) {
     for (int i = 0; i < NUM_OBJECTS; i++) {
         float z = min_z + (float)rand() / RAND_MAX * (max_z - min_z);
-        // 近似赛道中心X
         float base_x = 8.0f * sinf(z * 0.1f) + 5.0f * cosf(z * 0.23f);
         float offset = (15.0f + (float)rand() / RAND_MAX * 20.0f) * (rand()%2 ? 1 : -1);
         float x = base_x + offset;
         float y = 3.0f * sinf(z * 0.15f) + 2.0f * cosf(z * 0.37f) + ((float)rand()/RAND_MAX-0.5f)*4.0f;
-
         objects[i].pos = (vec3){x, y, z};
 
         int r = rand() % 5;
@@ -349,6 +336,7 @@ typedef struct {
     vec3 pos;
     float yaw;
     float speed;
+    float pitch;   // 当前俯仰角（弧度）
 } Car;
 
 static double get_time(void) {
@@ -377,17 +365,15 @@ int main(int argc, char** argv) {
 
     init_screen();
 
-    // 创建无限赛道
     InfiniteTrack* track = create_infinite_track();
     update_track(track);
-
-    // 生成景物
     generate_objects(track, track->ctrl_pts[0].z, track->ctrl_pts[NUM_CTRL_PTS-1].z);
 
     Car car = {
         .pos = track->center[0],
         .yaw = 0,
-        .speed = 0
+        .speed = 0,
+        .pitch = 0.0f
     };
 
     float near = 1.0f, far = 200.0f;
@@ -413,6 +399,16 @@ int main(int argc, char** argv) {
         // 输入
         if (key_state[KEY_Q]) running = 0;
 
+        // 俯仰控制（U / I）
+        if (key_state[KEY_U]) {
+            car.pitch += PITCH_SPEED * delta_time;
+            if (car.pitch > PITCH_LIMIT_RAD) car.pitch = PITCH_LIMIT_RAD;
+        }
+        if (key_state[KEY_I]) {
+            car.pitch -= PITCH_SPEED * delta_time;
+            if (car.pitch < -PITCH_LIMIT_RAD) car.pitch = -PITCH_LIMIT_RAD;
+        }
+
         float steer = 0;
         if (key_state[KEY_A]) steer += 1;
         if (key_state[KEY_D]) steer -= 1;
@@ -429,7 +425,7 @@ int main(int argc, char** argv) {
         car.pos.x += dir.x * car.speed * delta_time;
         car.pos.z += dir.z * car.speed * delta_time;
 
-        // 找到最近的赛道点，获取法线和目标点
+        // 找到最近的赛道点
         int best_idx = 0;
         float min_dist = 1e9;
         for (int i=0; i<track->total_points; i++) {
@@ -442,23 +438,42 @@ int main(int argc, char** argv) {
             }
         }
         vec3 target = track->center[best_idx];
-        car.pos.y = target.y + 0.5f; // 车辆略高于路面
+        car.pos.y = target.y + 0.5f;
 
-        // 获取路面法线
         vec3 normal = track->normal[best_idx];
 
-        // 检查是否需要扩展赛道
         advance_track(track, car.pos.z);
 
-        // 相机位置：基于车辆位置、前进方向、路面法线计算
-        // 注意：dir 是水平方向，normal 是路面法线，两者不一定垂直，但没关系
-        vec3 eye = vec3_add(car.pos, vec3_add(vec3_mul(dir, -CAMERA_DIST), vec3_mul(normal, CAMERA_HEIGHT)));
+        // 基础相机位置（无俯仰）
+        vec3 eye_base = vec3_add(car.pos, vec3_add(vec3_mul(dir, -CAMERA_DIST), vec3_mul(normal, CAMERA_HEIGHT)));
 
-        // 注视点：车辆位置（也可注视前方一点，这里保持简单）
-        vec3 center = car.pos;
+        // 基础注视点（车辆位置）
+        vec3 center_base = car.pos;
 
-        // 构建视图矩阵，使用路面法线作为 up 向量
-        mat4 view = mat4_lookat(eye, center, normal);
+        // 应用俯仰：绕右轴旋转视线方向
+        // 计算右向量（基于基础视线和法线）
+        vec3 view_dir = vec3_norm(vec3_sub(center_base, eye_base));
+        vec3 right = vec3_norm(vec3_cross(view_dir, normal)); // 右方向（水平）
+        // 绕 right 旋转 view_dir 得到新方向
+        float cos_p = cosf(car.pitch);
+        float sin_p = sinf(car.pitch);
+        // 使用罗德里格旋转公式
+        vec3 new_dir = vec3_add(
+            vec3_mul(view_dir, cos_p),
+            vec3_add(
+                vec3_mul(vec3_cross(right, view_dir), sin_p),
+                vec3_mul(right, vec3_dot(right, view_dir) * (1 - cos_p))
+            )
+        );
+        new_dir = vec3_norm(new_dir);
+
+        // 新注视点：保持相机位置不变，沿新方向看向远处
+        // 为简单，保持原距离，计算新注视点
+        float view_dist = vec3_len(vec3_sub(center_base, eye_base));
+        vec3 new_center = vec3_add(eye_base, vec3_mul(new_dir, view_dist));
+
+        // 构建视图矩阵，使用路面法线作为 up
+        mat4 view = mat4_lookat(eye_base, new_center, normal);
 
         // 渲染
         erase();
@@ -482,7 +497,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 绘制景物（仅绘制在可见范围内）
+        // 绘制景物
         for (int i=0; i<NUM_OBJECTS; i++) {
             if (fabs(objects[i].pos.z - car.pos.z) > 50.0f) continue;
             int sx, sy;
@@ -508,8 +523,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 显示信息
-        mvprintw(0, 0, "WASD 控制 | Q 退出 | 速度: %.2f m/s | FPS: %.1f | Z: %.1f", car.speed, fps, car.pos.z);
+        // 显示信息（包括俯仰角）
+        mvprintw(0, 0, "WASD 控制 | U/I 俯仰 | Q 退出 | 速度: %.2f m/s | 俯仰: %+3.0f° | FPS: %.1f | Z: %.1f",
+                 car.speed, car.pitch * 180.0f / M_PI, fps, car.pos.z);
 
         refresh();
         usleep(1000);
