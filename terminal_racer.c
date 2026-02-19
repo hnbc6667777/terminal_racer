@@ -1,11 +1,9 @@
 /*
  * terminal_racer.c
- * 一个在 Linux 终端中运行的 3D 赛车游戏原型。
- * 使用 ncurses 绘制，通过 /dev/input 获取精确按键输入。
- * 赛道由随机样条生成，包含透视投影。
+ * 增强版：更大赛道、基于帧时间的物理、FPS显示、速度单位
  *
  * 编译: gcc -o terminal_racer terminal_racer.c -lncurses -lm -lpthread
- * 运行: sudo ./terminal_racer /dev/input/eventX   (X为你的键盘设备号)
+ * 运行: sudo ./terminal_racer /dev/input/eventX
  */
 
 #include <stdio.h>
@@ -16,8 +14,9 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <sys/select.h>
+#include <sys/time.h>      // 添加时间头文件
 #include <ncurses.h>
-#include <pthread.h>      // 添加 pthread 头文件
+#include <pthread.h>
 
 // ---------- 3D 数学库 ----------
 typedef struct { float x, y, z; } vec3;
@@ -84,7 +83,7 @@ static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
 // ---------- 赛道生成 ----------
 #define TRACK_POINTS 50      // 控制点数量
 #define TRACK_SEGMENTS 200   // 插值点数量
-#define TRACK_WIDTH 2.0f     // 赛道半宽
+#define TRACK_WIDTH 4.0f     // 赛道半宽（加大）
 
 typedef struct {
     vec3 center[TRACK_SEGMENTS];   // 中心线点
@@ -106,16 +105,17 @@ static vec3 catmull_rom(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float t) {
             vec3_mul(p3, t3 - t2)));
 }
 
-// 生成随机闭合赛道
+// 生成随机闭合赛道（扩大范围）
 static Track generate_track(void) {
     vec3 points[TRACK_POINTS+3]; // 前后各加一个点用于闭合样条
     // 随机生成控制点（在 XZ 平面起伏，Y 轴为高度）
     for (int i=0; i<TRACK_POINTS; i++) {
         float angle = 2*M_PI * i / TRACK_POINTS;
-        float radius = 20.0f + 5*sinf(angle*3) + 3*cosf(angle*5); // 非圆形状
+        // 增大基础半径，增加变化幅度
+        float radius = 60.0f + 15*sinf(angle*3) + 10*cosf(angle*5); // 原来20
         float x = radius * cosf(angle);
         float z = radius * sinf(angle);
-        float y = 3*sinf(angle*4) + 2*cosf(angle*6); // 起伏
+        float y = 8*sinf(angle*4) + 5*cosf(angle*6); // 增大起伏
         points[i+1] = (vec3){x, y, z};
     }
     // 闭合：复制前两个点到末尾，后两个点到开头
@@ -152,7 +152,7 @@ static Track generate_track(void) {
 }
 
 // ---------- 输入处理 ----------
-#define MAX_KEYS 256                 // 改用不冲突的宏名
+#define MAX_KEYS 256
 static volatile int key_state[MAX_KEYS]; // 按键状态 (0=抬起,1=按下)
 
 static void* input_thread(void* arg) {
@@ -162,15 +162,14 @@ static void* input_thread(void* arg) {
         ssize_t n = read(fd, &ev, sizeof(ev));
         if (n == sizeof(ev)) {
             if (ev.type == EV_KEY && ev.code < MAX_KEYS) {
-                key_state[ev.code] = ev.value; // 0释放 1按下 2重复
+                key_state[ev.code] = ev.value;
             }
         }
-        pthread_testcancel(); // 添加取消点
+        pthread_testcancel();
     }
     return NULL;
 }
 
-// 只打开设备，不再创建线程
 static int open_input(const char* dev) {
     int fd = open(dev, O_RDONLY);
     if (fd < 0) {
@@ -188,7 +187,7 @@ static void init_screen(void) {
     cbreak();
     noecho();
     curs_set(0);
-    nodelay(stdscr, TRUE);  // 非阻塞
+    nodelay(stdscr, TRUE);
     getmaxyx(stdscr, scr_height, scr_width);
 }
 
@@ -196,25 +195,20 @@ static void close_screen(void) {
     endwin();
 }
 
-// 将 3D 世界坐标映射到屏幕坐标（像素位置）
-// 返回 0 表示点在视锥内，1 表示被裁剪（简单丢弃）
+// 将 3D 世界坐标映射到屏幕坐标
 static int project(vec3 world, mat4 view, mat4 proj, int* sx, int* sy) {
-    // 视图变换
     vec3 view_pos = mat4_mul_vec3(view, world, 1.0f);
-    // 投影变换 + 透视除法
     vec3 clip = mat4_mul_vec3(proj, view_pos, 1.0f);
-    // 检查裁剪空间范围（粗略）
     if (fabs(clip.x) > 1 || fabs(clip.y) > 1 || fabs(clip.z) > 1)
         return 0;
-    // 映射到屏幕坐标
     *sx = (int)((clip.x + 1) * 0.5 * scr_width);
-    *sy = (int)((1 - (clip.y + 1) * 0.5) * scr_height); // 翻转 Y
+    *sy = (int)((1 - (clip.y + 1) * 0.5) * scr_height);
     if (*sx < 0 || *sx >= scr_width || *sy < 0 || *sy >= scr_height)
         return 0;
     return 1;
 }
 
-// 画线（简单 Bresenham 实现，仅画点）
+// 画线
 static void draw_line(int x0, int y0, int x1, int y1, chtype ch) {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
@@ -233,8 +227,15 @@ static void draw_line(int x0, int y0, int x1, int y1, chtype ch) {
 typedef struct {
     vec3 pos;       // 车辆位置
     float yaw;      // 朝向角 (弧度)
-    float speed;    // 当前速度
+    float speed;    // 速度 (米/秒)
 } Car;
+
+// 时间测量函数
+static double get_time(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1000000.0;
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -242,11 +243,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 打开输入设备
     int fd = open_input(argv[1]);
     if (fd < 0) return 1;
 
-    // 启动输入线程
     pthread_t input_th;
     if (pthread_create(&input_th, NULL, input_thread, &fd) != 0) {
         perror("pthread_create");
@@ -254,21 +253,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 初始化 ncurses
     init_screen();
 
-    // 生成赛道
+    // 生成更大赛道
     Track track = generate_track();
 
-    // 初始化车辆
     Car car = {
         .pos = track.center[0],
         .yaw = 0,
         .speed = 0
     };
 
-    // 投影参数 (假设视野 60°, 宽高比由终端决定)
-    float near = 1.0f, far = 100.0f;
+    // 投影参数 (增大 far 平面以看到更远)
+    float near = 1.0f, far = 200.0f;    // far 从 100 增加到 200
     float fov = 60.0f * M_PI / 180.0f;
     float aspect = (float)scr_width / scr_height;
     float top = near * tanf(fov/2);
@@ -277,28 +274,44 @@ int main(int argc, char** argv) {
     float left = -right;
     mat4 proj = mat4_frustum(left, right, bottom, top, near, far);
 
-    // 主循环
+    // 时间相关变量
+    double last_time = get_time();
+    double fps = 0.0;
+
     int running = 1;
     while (running) {
+        // 计算帧时间
+        double current_time = get_time();
+        double delta_time = current_time - last_time;
+        if (delta_time > 0.1) delta_time = 0.1; // 防止卡顿时跳跃过大
+        last_time = current_time;
+        fps = 1.0 / delta_time;
+
         // 处理输入
-        if (key_state[KEY_Q]) running = 0;          // Q 退出
-        // 转向
+        if (key_state[KEY_Q]) running = 0;
+
+        // 转向 (角速度，基于时间)
         float steer = 0;
         if (key_state[KEY_A]) steer += 1;
         if (key_state[KEY_D]) steer -= 1;
-        car.yaw += steer * 0.05f;
+        car.yaw += steer * 2.0f * delta_time;  // 2 rad/s 的转向速度
 
-        // 加减速
-        if (key_state[KEY_W]) car.speed += 0.1f;
-        if (key_state[KEY_S]) car.speed -= 0.1f;
-        // 简单摩擦
-        car.speed *= 0.98f;
+        // 加减速 (加速度，基于时间)
+        float accel = 0;
+        if (key_state[KEY_W]) accel += 10.0f;   // 10 m/s² 加速
+        if (key_state[KEY_S]) accel -= 8.0f;    // 8 m/s² 倒车/刹车
+        car.speed += accel * delta_time;
 
-        // 根据速度和方向移动车辆
+        // 简单摩擦 (阻力系数 2.0 s^-1)
+        car.speed *= (1.0f - 2.0f * delta_time);
+        if (fabs(car.speed) < 0.001f) car.speed = 0;
+
+        // 根据速度和方向移动车辆 (基于时间)
         vec3 dir = { sinf(car.yaw), 0, cosf(car.yaw) };
-        car.pos.x += dir.x * car.speed;
-        car.pos.z += dir.z * car.speed;
-        // 简单高度跟随赛道（最近点）
+        car.pos.x += dir.x * car.speed * delta_time;
+        car.pos.z += dir.z * car.speed * delta_time;
+
+        // 高度跟随赛道（最近点）
         float min_dist = 1e9;
         vec3 target = car.pos;
         for (int i=0; i<track.count; i++) {
@@ -310,10 +323,10 @@ int main(int argc, char** argv) {
                 target = track.center[i];
             }
         }
-        car.pos.y = target.y + 0.5f; // 车辆略高于赛道
+        car.pos.y = target.y + 0.5f;
 
-        // 设置相机 (跟随车辆后方)
-        vec3 eye = vec3_add(car.pos, (vec3){ -10*sinf(car.yaw), 3, -10*cosf(car.yaw) });
+        // 设置相机 (跟随车辆后方，距离增加以适应更大赛道)
+        vec3 eye = vec3_add(car.pos, (vec3){ -20*sinf(car.yaw), 6, -20*cosf(car.yaw) });
         vec3 center = car.pos;
         vec3 up = {0,1,0};
         mat4 view = mat4_lookat(eye, center, up);
@@ -337,11 +350,12 @@ int main(int argc, char** argv) {
         if (project(car.pos, view, proj, &car_x, &car_y))
             mvaddch(car_y, car_x, '@');
 
-        // 显示帮助信息
-        mvprintw(0, 0, "WASD 控制 | Q 退出 | 速度: %.2f", car.speed);
+        // 显示信息：速度（带单位）和 FPS
+        mvprintw(0, 0, "WASD 控制 | Q 退出 | 速度: %.2f m/s | FPS: %.1f", car.speed, fps);
 
         refresh();
-        usleep(16000); // 约 60 FPS
+        // 不再固定延时，让循环自由运行，由 delta_time 控制物理
+        usleep(1000); // 微小延时防止 CPU 100%
     }
 
     close_screen();
