@@ -1,6 +1,6 @@
 /*
  * terminal_racer.c
- * 终极版：无限赛道 + 地形自适应相机 + 可调俯仰角(U/I) + 重力势能 + 彩色渲染 + 中心虚线 + 随机景物
+ * 终极修复版：解决远距离渲染问题 + 重力势能 + 可调俯仰 + 无限赛道 + 彩色渲染
  *
  * 可调参数宏定义（位于文件开头）
  *   GRAVITY          重力加速度 (m/s²) 默认 9.8
@@ -40,12 +40,13 @@
 #define PITCH_SPEED      1.0f     // 俯仰调整速度 (rad/s)
 #define PITCH_LIMIT      30.0f    // 俯仰角度限制（度）
 #define TRACK_WIDTH      4.0f     // 赛道半宽
-#define ACCEL_FORWARD    10.0f    // 前进加速度 (m/s²)
+#define ACCEL_FORWARD    40.0f    // 前进加速度 (m/s²)
 #define ACCEL_BACK       8.0f     // 刹车/倒车加速度 (m/s²)
 #define FRICTION_COEF    2.0f     // 摩擦系数 (1/s)
 #define CTRL_PT_DIST     10.0f    // 控制点间隔（米）
 #define NUM_CTRL_PTS     30       // 控制点数量
 #define NUM_SEGMENTS     200      // 每段插值点数
+#define FAR_PLANE        300.0f   // 远平面距离（增大以看到更远）
 
 // 俯仰限制转换为弧度
 #define PITCH_LIMIT_RAD (PITCH_LIMIT * M_PI / 180.0f)
@@ -210,6 +211,19 @@ static void advance_track(InfiniteTrack* track, float car_z) {
     }
 }
 
+// 重置赛道原点，防止浮点数过大
+static void reset_track_origin(InfiniteTrack* track, float offset_z) {
+    for (int i = 0; i < NUM_CTRL_PTS; i++) {
+        track->ctrl_pts[i].z -= offset_z;
+    }
+    for (int i = 0; i < track->total_points; i++) {
+        track->center[i].z -= offset_z;
+        track->left[i].z -= offset_z;
+        track->right[i].z -= offset_z;
+        // 法线和切线不需要平移
+    }
+}
+
 static void free_track(InfiniteTrack* track) {
     free(track->ctrl_pts);
     free(track->center);
@@ -247,6 +261,13 @@ static void generate_objects(InfiniteTrack* track, float min_z, float max_z) {
             case 3: objects[i].ch = 'Y'; objects[i].color_pair = 5; break;
             case 4: objects[i].ch = '^'; objects[i].color_pair = 6; break;
         }
+    }
+}
+
+// 重置景物原点
+static void reset_objects_origin(float offset_z) {
+    for (int i = 0; i < NUM_OBJECTS; i++) {
+        objects[i].pos.z -= offset_z;
     }
 }
 
@@ -374,7 +395,7 @@ int main(int argc, char** argv) {
         .pitch = 0.0f
     };
 
-    float near = 1.0f, far = 200.0f;
+    float near = 1.0f, far = FAR_PLANE;
     float fov = 60.0f * M_PI / 180.0f;
     float aspect = (float)scr_width / scr_height;
     float top = near * tanf(fov/2);
@@ -432,13 +453,11 @@ int main(int argc, char** argv) {
         vec3 target = track->center[best_idx];
         car.pos.y = target.y + 0.5f;
 
-        // 获取当前路面的切线方向（车辆前进方向应沿赛道）
+        // 获取当前路面的切线方向
         vec3 tangent = track->tangent[best_idx];
 
-        // 重力加速度沿切线的分量：重力向量 (0, -GRAVITY, 0) 点乘切线方向
-        // 因为重力向下，切线方向的分量 = GRAVITY * (切线在Y方向的分量的负值)
-        // 即 GRAVITY * (-tangent.y)
-        float gravity_accel = -GRAVITY * tangent.y;  // 当 tangent.y 为正（上坡）时，gravity_accel 为负（减速）
+        // 重力加速度沿切线的分量
+        float gravity_accel = -GRAVITY * tangent.y;
 
         // 总加速度 = 油门加速度 + 重力分量
         float total_accel = throttle_accel + gravity_accel;
@@ -458,6 +477,15 @@ int main(int argc, char** argv) {
 
         // 扩展赛道
         advance_track(track, car.pos.z);
+
+        // ---------- 坐标重置，防止浮点数过大 ----------
+        if (car.pos.z > 500.0f) {
+            reset_track_origin(track, 500.0f);
+            reset_objects_origin(500.0f);
+            car.pos.z -= 500.0f;
+            // 重置 last_time 避免 delta_time 突变
+            last_time = get_time();
+        }
 
         // 基础相机位置
         vec3 eye_base = vec3_add(car.pos, vec3_add(vec3_mul(dir, -CAMERA_DIST), vec3_mul(normal, CAMERA_HEIGHT)));
@@ -529,7 +557,7 @@ int main(int argc, char** argv) {
         }
 
         // 显示信息（包括坡度）
-        float slope_percent = -tangent.y * 100.0f; // 正为上坡，负为下坡
+        float slope_percent = -tangent.y * 100.0f;
         mvprintw(0, 0, "WASD 控制 | U/I 俯仰 | Q 退出 | 速度: %+6.2f m/s | 坡度: %+5.1f%% | 俯仰: %+3.0f° | FPS: %.1f | Z: %.1f",
                  car.speed, slope_percent, car.pitch * 180.0f / M_PI, fps, car.pos.z);
 
